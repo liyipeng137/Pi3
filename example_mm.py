@@ -19,6 +19,10 @@ if __name__ == '__main__':
 
     parser.add_argument("--save_path", type=str, default='examples/result.ply',
                         help="Path to save the output .ply file.")
+    parser.add_argument("--save_transforms", type=str, default=None,
+                        help="Path to save transforms.json with camera poses and intrinsics. Default: None (not saved)")
+    parser.add_argument("--use_moge_intrinsics", action='store_true',
+                        help="Use MoGe method to recover intrinsics from local_points. Default: False (use input or default)")
     parser.add_argument("--interval", type=int, default=-1,
                         help="Interval to sample image. Default: 1 for images dir, 10 for video")
     parser.add_argument("--ckpt", type=str, default=None,
@@ -120,3 +124,77 @@ if __name__ == '__main__':
         
     write_ply(res['points'][0][masks].cpu(), imgs[0].permute(0, 2, 3, 1)[masks], args.save_path)
     print("Done.")
+    
+    # 6. Save transforms.json (optional)
+    if args.save_transforms:
+        print("\n" + "="*60)
+        print("保存相机位姿和内参到 transforms.json...")
+        print("="*60)
+        
+        from pi3.utils.transforms_utils import save_transforms_json, generate_image_paths
+        from PIL import Image
+        
+        # 提取位姿 (OpenCV camera-to-world)
+        camera_poses = res['camera_poses'][0].cpu().numpy()  # (N, 4, 4)
+        N = camera_poses.shape[0]
+        H, W = imgs.shape[-2:]
+        
+        # 获取内参
+        intrinsics_np = None
+        if conditions.get('intrinsics') is not None:
+            intrinsics_np = conditions['intrinsics'][0].cpu().numpy()  # (N, 3, 3)
+            print(f"使用输入的内参")
+        
+        # 生成图像路径
+        image_paths = generate_image_paths(args.data_path, N, save_dir='images')
+        
+        # 保存 resize 后的图片（先保存图片，再生成正确的路径）
+        output_dir = os.path.dirname(args.save_transforms) or '.'
+        images_dir = os.path.join(output_dir, 'images')
+        os.makedirs(images_dir, exist_ok=True)
+        
+        print(f"保存 resize 后的图片到: {images_dir}")
+        imgs_np = imgs[0].cpu().numpy()  # (N, 3, H, W)
+        
+        # 保存图片并更新路径
+        updated_image_paths = []
+        for i in range(N):
+            # 提取文件名（从 image_paths 中获取，如 "./images/frame_0000.png"）
+            img_filename = os.path.basename(image_paths[i])
+            
+            # 对于非标准扩展名（如 .heic），统一保存为 .png
+            name_without_ext, ext = os.path.splitext(img_filename)
+            if ext.lower() in ['.heic', '.jpeg']:
+                img_filename = name_without_ext + '.png'
+            elif ext.lower() == '.jpg':
+                img_filename = name_without_ext + '.jpg'  # 保持 jpg
+            else:
+                img_filename = name_without_ext + '.png'  # 默认 png
+            
+            save_path = os.path.join(images_dir, img_filename)
+            
+            # 转换为 PIL Image (0-1范围转为0-255)
+            img_array = imgs_np[i].transpose(1, 2, 0)  # (3, H, W) -> (H, W, 3)
+            img_array = (img_array * 255).clip(0, 255).astype(np.uint8)
+            img_pil = Image.fromarray(img_array)
+            
+            # 保存
+            img_pil.save(save_path)
+            
+            # 更新路径
+            updated_image_paths.append(f"./images/{img_filename}")
+        
+        print(f"已保存 {N} 张图片到 {images_dir}")
+        
+        # 保存 transforms.json（使用更新后的路径）
+        save_transforms_json(
+            output_path=args.save_transforms,
+            camera_poses=camera_poses,
+            intrinsics=intrinsics_np,
+            image_paths=updated_image_paths,
+            image_size=(H, W),
+            res=res if args.use_moge_intrinsics else None,
+            imgs=imgs if args.use_moge_intrinsics else None,
+            use_moge_recovery=args.use_moge_intrinsics
+        )
+        print("="*60 + "\n")
