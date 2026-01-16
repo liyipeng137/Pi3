@@ -76,7 +76,10 @@ def load_images_as_tensor(path="data/truck", interval=1, PIXEL_LIMIT=255000, ver
     for img_pil in sources:
         try:
             # Resize to the uniform target size
-            resized_img = img_pil.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
+            # resized_img = img_pil.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
+
+            # skip resize
+            resized_img = img_pil
             # Convert to tensor
             img_tensor = to_tensor_transform(resized_img)
             tensor_list.append(img_tensor)
