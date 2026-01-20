@@ -27,8 +27,9 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 from PIL import Image, ImageOps
 
@@ -94,6 +95,42 @@ def _scale_box(box: Tuple[int, int, int, int], k: int) -> Tuple[int, int, int, i
     return l * k, t * k, r * k, b * k
 
 
+def _update_intrinsics(
+    fx0: float, fy0: float, cx0: float, cy0: float,
+    w0: int, h0: int,
+    w_new: int, h_new: int,
+    crop_box: Tuple[int, int, int, int],
+) -> Tuple[float, float, float, float]:
+    """更新内参：先 resize 再 crop。
+    
+    Args:
+        fx0, fy0, cx0, cy0: 原始内参
+        w0, h0: 原始尺寸
+        w_new, h_new: resize 后尺寸
+        crop_box: (left, top, right, bottom) 裁剪框
+    
+    Returns:
+        (fx_new, fy_new, cx_new, cy_new)
+    """
+    left, top, _, _ = crop_box
+    
+    # Resize: 内参按比例缩放
+    scale_x = w_new / w0
+    scale_y = h_new / h0
+    fx_resized = fx0 * scale_x
+    fy_resized = fy0 * scale_y
+    cx_resized = cx0 * scale_x
+    cy_resized = cy0 * scale_y
+    
+    # Crop: 焦距不变，主点减去裁剪偏移
+    fx_new = fx_resized
+    fy_new = fy_resized
+    cx_new = cx_resized - left
+    cy_new = cy_resized - top
+    
+    return fx_new, fy_new, cx_new, cy_new
+
+
 def _save_image(img: Image.Image, out_path: Path) -> None:
     _ensure_dir(out_path.parent)
 
@@ -106,6 +143,130 @@ def _save_image(img: Image.Image, out_path: Path) -> None:
         img.save(out_path)
 
 
+def _process_transforms_json(
+    transforms_path: Path,
+    images_root: Path,
+    transform_infos: Dict[str, Dict],
+    stage1_out_root: Path,
+    stage2_out_root: Path,
+) -> None:
+    """读取 transforms.json，更新内参，保存到两个阶段的输出目录。
+    
+    Args:
+        transforms_path: 原始 transforms.json 路径
+        images_root: 图片根目录
+        transform_infos: {相对路径: transform_info} 映射
+        stage1_out_root: Stage-1 输出目录
+        stage2_out_root: Stage-2 输出目录
+    """
+    with open(transforms_path, 'r') as f:
+        data = json.load(f)
+    
+    # 检测是否有全局内参
+    has_global_intrinsics = all(k in data for k in ['fl_x', 'fl_y', 'cx', 'cy', 'w', 'h'])
+    
+    # 准备两个输出的 transforms.json
+    data_stage1 = json.loads(json.dumps(data))  # 深拷贝
+    data_stage2 = json.loads(json.dumps(data))
+    
+    # 处理每个 frame
+    for i, frame in enumerate(data['frames']):
+        file_path = frame['file_path']
+        # 规范化路径（去除前导 ./）
+        file_path_normalized = file_path.lstrip('./')
+        
+        # 匹配 transform_info
+        if file_path_normalized not in transform_infos:
+            print(f"警告: transforms.json 中的 {file_path} 未找到对应的处理结果，跳过")
+            continue
+        
+        info = transform_infos[file_path_normalized]
+        
+        # 获取原始内参（优先使用 per-frame，其次使用全局）
+        if 'fl_x' in frame:
+            fx0 = frame['fl_x']
+            fy0 = frame['fl_y']
+            cx0 = frame['cx']
+            cy0 = frame['cy']
+            w0 = frame['w']
+            h0 = frame['h']
+        elif has_global_intrinsics:
+            fx0 = data['fl_x']
+            fy0 = data['fl_y']
+            cx0 = data['cx']
+            cy0 = data['cy']
+            w0 = data['w']
+            h0 = data['h']
+        else:
+            print(f"警告: {file_path} 没有内参信息，跳过")
+            continue
+        
+        # 验证尺寸一致性
+        if info['w0'] != w0 or info['h0'] != h0:
+            print(f"警告: {file_path} 的尺寸不一致 (transforms: {w0}x{h0}, 实际: {info['w0']}x{info['h0']})")
+        
+        # 计算 Stage-1 内参
+        fx1, fy1, cx1, cy1 = _update_intrinsics(
+            fx0, fy0, cx0, cy0,
+            info['w0'], info['h0'],
+            info['w1'], info['h1'],
+            info['box1'],
+        )
+        w1_final = info['box1'][2] - info['box1'][0]
+        h1_final = info['box1'][3] - info['box1'][1]
+        
+        # 计算 Stage-2 内参
+        fx2, fy2, cx2, cy2 = _update_intrinsics(
+            fx0, fy0, cx0, cy0,
+            info['w0'], info['h0'],
+            info['w2'], info['h2'],
+            info['box2'],
+        )
+        w2_final = info['box2'][2] - info['box2'][0]
+        h2_final = info['box2'][3] - info['box2'][1]
+        
+        # 更新 Stage-1 frame
+        data_stage1['frames'][i].update({
+            'w': w1_final,
+            'h': h1_final,
+            'fl_x': fx1,
+            'fl_y': fy1,
+            'cx': cx1,
+            'cy': cy1,
+        })
+        
+        # 更新 Stage-2 frame
+        data_stage2['frames'][i].update({
+            'w': w2_final,
+            'h': h2_final,
+            'fl_x': fx2,
+            'fl_y': fy2,
+            'cx': cx2,
+            'cy': cy2,
+        })
+    
+    # 如果有全局内参，删除它（因为每个 frame 都有自己的内参了）
+    if has_global_intrinsics:
+        for key in ['fl_x', 'fl_y', 'cx', 'cy', 'w', 'h']:
+            data_stage1.pop(key, None)
+            data_stage2.pop(key, None)
+    
+    # 保存
+    out_path1 = stage1_out_root / 'transforms.json'
+    out_path2 = stage2_out_root / 'transforms.json'
+    
+    _ensure_dir(out_path1.parent)
+    _ensure_dir(out_path2.parent)
+    
+    with open(out_path1, 'w') as f:
+        json.dump(data_stage1, f, indent=4)
+    print(f"已保存 Stage-1 transforms.json 到: {out_path1}")
+    
+    with open(out_path2, 'w') as f:
+        json.dump(data_stage2, f, indent=4)
+    print(f"已保存 Stage-2 transforms.json 到: {out_path2}")
+
+
 def process_one(
     in_path: Path,
     images_root: Path,
@@ -113,7 +274,17 @@ def process_one(
     stage2_out_root: Path,
     stage1_downscale_n: int,
     multiple: int,
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, Optional[Dict]]:
+    """处理单张图片，返回成功状态、消息和变换参数。
+    
+    Returns:
+        (success, message, transform_info)
+        transform_info: {
+            'w0': int, 'h0': int,
+            'w1': int, 'h1': int, 'box1': tuple,
+            'w2': int, 'h2': int, 'box2': tuple,
+        }
+    """
     rel = in_path.relative_to(images_root)
     out1 = stage1_out_root / rel
     out2 = stage2_out_root / rel
@@ -145,14 +316,20 @@ def process_one(
             im2 = im2_base.crop(box2)
             _save_image(im2, out2)
 
+            transform_info = {
+                'w0': w0, 'h0': h0,
+                'w1': w1, 'h1': h1, 'box1': box1,
+                'w2': w2, 'h2': h2, 'box2': box2,
+            }
+
             msg = (
                 f"OK  {rel} | orig {w0}x{h0} -> stage1_base {w1}x{h1} crop {im1.size[0]}x{im1.size[1]} "
                 f"-> stage2_base {w2}x{h2} crop {im2.size[0]}x{im2.size[1]}"
             )
-            return True, msg
+            return True, msg, transform_info
 
     except Exception as e:
-        return False, f"ERR {rel} | {type(e).__name__}: {e}"
+        return False, f"ERR {rel} | {type(e).__name__}: {e}", None
 
 
 def parse_args() -> argparse.Namespace:
@@ -182,6 +359,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Stage-1 crop so that width and height are multiples of this value (default: 14).",
     )
+    p.add_argument(
+        "--transforms-json",
+        type=Path,
+        help="Optional: transforms.json path. If provided, will update intrinsics and save to output directories.",
+    )
     p.add_argument("--recursive", action="store_true", help="Recurse into subdirectories")
     p.add_argument("--quiet", action="store_true", help="Suppress per-file logs")
     return p.parse_args()
@@ -205,8 +387,10 @@ def main() -> None:
 
     ok = 0
     err = 0
+    transform_infos = {}  # {相对路径: transform_info}
+    
     for f in files:
-        success, msg = process_one(
+        success, msg, info = process_one(
             f,
             images_root=images_dir,
             stage1_out_root=args.stage1_out,
@@ -216,12 +400,29 @@ def main() -> None:
         )
         if success:
             ok += 1
+            if info:
+                rel = f.relative_to(images_dir)
+                transform_infos[str(rel)] = info
         else:
             err += 1
         if not args.quiet:
             print(msg)
 
     print(f"Done. OK={ok} ERR={err} TOTAL={ok + err}")
+    
+    # 处理 transforms.json（如果提供）
+    if args.transforms_json:
+        if not args.transforms_json.exists():
+            print(f"警告: transforms.json 不存在: {args.transforms_json}")
+        else:
+            print(f"\n处理 transforms.json...")
+            _process_transforms_json(
+                args.transforms_json,
+                images_dir,
+                transform_infos,
+                args.stage1_out,
+                args.stage2_out,
+            )
 
 
 if __name__ == "__main__":

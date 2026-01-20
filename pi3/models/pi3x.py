@@ -446,10 +446,13 @@ class Pi3X(nn.Module, PyTorchModelHubMixin):
             pos = torch.cat([pos_special, pos_patch], dim=1)
 
         if self.use_multimodal:
-            view_interaction_mask = use_pose_mask.unsqueeze(2) & use_pose_mask.unsqueeze(1)
-            token_interaction_mask = view_interaction_mask.repeat_interleave(hw - self.patch_start_idx, dim=1)
-            token_interaction_mask = token_interaction_mask.repeat_interleave(hw - self.patch_start_idx, dim=2)
-            pose_inject_mask = token_interaction_mask[:, None]
+            if use_pose_mask.sum() == B * N:
+                pose_inject_mask = None
+            else:
+                view_interaction_mask = use_pose_mask.unsqueeze(2) & use_pose_mask.unsqueeze(1)
+                token_interaction_mask = view_interaction_mask.repeat_interleave(hw - self.patch_start_idx, dim=1)
+                token_interaction_mask = token_interaction_mask.repeat_interleave(hw - self.patch_start_idx, dim=2)
+                pose_inject_mask = token_interaction_mask[:, None]
 
         for i in range(len(self.decoder)):
             blk = self.decoder[i]
