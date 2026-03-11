@@ -2,9 +2,144 @@ import torch
 import argparse
 import numpy as np
 import os
+import cv2
 from pi3.utils.basic import load_multimodal_data, write_ply
 from pi3.utils.geometry import depth_edge
 from pi3.models.pi3x import Pi3X
+
+
+
+# depth_frame = np.nan_to_num(depth_np[idx], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+# depth_u16 = np.clip(depth_frame * 1000.0, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+# stem = os.path.splitext(os.path.basename(str(image_names[idx])))[0]
+# base_name = stem + ".png"
+# cv2.imwrite(os.path.join(depth_u16_dir, base_name), depth_u16)
+
+
+def generate_sampled_image_names(data_path, num_frames, interval):
+    if os.path.isdir(data_path):
+        filenames = sorted(
+            [x for x in os.listdir(data_path) if x.lower().endswith((".png", ".jpg", ".jpeg", ".heic"))]
+        )
+        return filenames[::interval][:num_frames]
+    return [f"frame_{i:04d}.png" for i in range(num_frames)]
+
+
+def project_world_points_to_depth(world_points, camera_poses, intrinsics, image_size):
+    """
+    Reproject world-space points (from exported ply) into each camera and build depth maps via z-buffer.
+    Args:
+        world_points: (P, 3) world points
+        camera_poses: (N, 4, 4) OpenCV cam2world
+        intrinsics:   (N, 3, 3) per-frame intrinsics
+        image_size:   (H, W)
+    Returns:
+        depth_maps: (N, H, W), metric depth in meters
+    """
+    H, W = image_size
+    N = camera_poses.shape[0]
+    depth_maps = np.zeros((N, H, W), dtype=np.float32)
+
+    if world_points.size == 0:
+        return depth_maps
+
+    world_points = np.asarray(world_points, dtype=np.float32)
+    world_points_h = np.concatenate(
+        [world_points, np.ones((world_points.shape[0], 1), dtype=np.float32)],
+        axis=1,
+    )
+
+    for i in range(N):
+        K = intrinsics[i].astype(np.float32, copy=False)
+        T_w2c = np.linalg.inv(camera_poses[i]).astype(np.float32)
+        cam_points = (T_w2c @ world_points_h.T).T[:, :3]
+
+        z = cam_points[:, 2]
+        valid = np.isfinite(z) & (z > 1e-6)
+        if not np.any(valid):
+            continue
+
+        cam_points = cam_points[valid]
+        x = cam_points[:, 0]
+        y = cam_points[:, 1]
+        z = cam_points[:, 2]
+
+        u = K[0, 0] * (x / z) + K[0, 2]
+        v = K[1, 1] * (y / z) + K[1, 2]
+
+        valid_uv = np.isfinite(u) & np.isfinite(v)
+        if not np.any(valid_uv):
+            continue
+
+        u = np.rint(u[valid_uv]).astype(np.int32)
+        v = np.rint(v[valid_uv]).astype(np.int32)
+        z = z[valid_uv].astype(np.float32, copy=False)
+
+        in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        if not np.any(in_bounds):
+            continue
+
+        u = u[in_bounds]
+        v = v[in_bounds]
+        z = z[in_bounds]
+
+        depth_flat = np.full(H * W, np.inf, dtype=np.float32)
+        idx = v * W + u
+        np.minimum.at(depth_flat, idx, z)
+
+        depth = depth_flat.reshape(H, W)
+        depth[~np.isfinite(depth)] = 0.0
+        depth_maps[i] = depth
+
+    return depth_maps
+
+
+def save_depth_pngs(depth_np, image_names, output_dir):
+    """
+    Save depth as:
+      1) uint16 millimeter PNG for downstream usage
+      2) uint8 pseudo-color PNG for quick visual inspection
+      3) float32 NPY per-frame depth for downstream numeric processing
+    """
+    depth_u16_dir = os.path.join(output_dir, "depth_u16")
+    depth_vis_dir = os.path.join(output_dir, "depth_vis")
+    depth_npy_dir = os.path.join(output_dir, "depth_npy")
+    os.makedirs(depth_u16_dir, exist_ok=True)
+    os.makedirs(depth_vis_dir, exist_ok=True)
+    os.makedirs(depth_npy_dir, exist_ok=True)
+
+    for idx in range(depth_np.shape[0]):
+        depth_frame = np.nan_to_num(depth_np[idx], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        depth_u16 = np.clip(depth_frame * 1000.0, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+
+        if idx < len(image_names):
+            stem = os.path.splitext(os.path.basename(str(image_names[idx])))[0]
+        else:
+            stem = f"frame_{idx:04d}"
+        base_name = stem + ".png"
+
+        cv2.imwrite(os.path.join(depth_u16_dir, base_name), depth_u16)
+        np.save(os.path.join(depth_npy_dir, stem + ".npy"), depth_frame.astype(np.float32, copy=False))
+
+        valid_mask = np.isfinite(depth_frame) & (depth_frame > 0)
+        if np.any(valid_mask):
+            d = depth_frame[valid_mask]
+            d_min = np.percentile(d, 2.0)
+            d_max = np.percentile(d, 98.0)
+            if d_max <= d_min:
+                d_max = d_min + 1e-6
+
+            depth_norm = (depth_frame - d_min) / (d_max - d_min)
+            depth_norm = np.clip(depth_norm, 0.0, 1.0)
+            depth_vis_u8 = (depth_norm * 255.0).astype(np.uint8)
+            depth_vis_u8[~valid_mask] = 0
+            depth_color = cv2.applyColorMap(depth_vis_u8, cv2.COLORMAP_TURBO)
+        else:
+            h, w = depth_frame.shape[:2]
+            depth_color = np.zeros((h, w, 3), dtype=np.uint8)
+
+        cv2.imwrite(os.path.join(depth_vis_dir, base_name), depth_color)
+
 
 if __name__ == '__main__':
     # --- Argument Parsing ---
@@ -19,6 +154,8 @@ if __name__ == '__main__':
 
     parser.add_argument("--save_path", type=str, default='examples/result.ply',
                         help="Path to save the output .ply file.")
+    parser.add_argument("--save_depth_dir", type=str, default=None,
+                        help="Optional directory to save projected per-view depth maps (uint16 + visualization png).")
     parser.add_argument("--save_transforms", type=str, default=None,
                         help="Path to save transforms.json with camera poses and intrinsics. Default: None (not saved)")
     parser.add_argument("--use_moge_intrinsics", action='store_true',
@@ -125,7 +262,28 @@ if __name__ == '__main__':
     write_ply(res['points'][0][masks].cpu(), imgs[0].permute(0, 2, 3, 1)[masks], args.save_path)
     print("Done.")
     
-    # 6. Save transforms.json (optional)
+    # 6. Save depth maps from exported ply points + camera poses (optional)
+    if args.save_depth_dir:
+        print(f"Saving depth maps to: {args.save_depth_dir}")
+        from pi3.utils.transforms_utils import recover_intrinsics_from_output
+
+        camera_poses = res['camera_poses'][0].detach().cpu().numpy()  # (N, 4, 4), OpenCV cam2world
+        intrinsics_np = recover_intrinsics_from_output(res, imgs)      # (N, 3, 3)
+        world_points = res['points'][0][masks].detach().cpu().numpy()  # same points exported to ply
+        H, W = imgs.shape[-2:]
+
+        depth_np = project_world_points_to_depth(
+            world_points=world_points,
+            camera_poses=camera_poses,
+            intrinsics=intrinsics_np,
+            image_size=(H, W),
+        )
+
+        image_names = generate_sampled_image_names(args.data_path, camera_poses.shape[0], args.interval)
+        save_depth_pngs(depth_np=depth_np, image_names=image_names, output_dir=args.save_depth_dir)
+        print("Depth maps saved.")
+
+    # 7. Save transforms.json (optional)
     if args.save_transforms:
         print("\n" + "="*60)
         print("保存相机位姿和内参到 transforms.json...")
