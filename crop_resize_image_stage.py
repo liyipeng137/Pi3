@@ -131,6 +131,24 @@ def _update_intrinsics(
     return fx_new, fy_new, cx_new, cy_new
 
 
+def _set_avg_intrinsics(data: Dict, sums: Dict[str, float], count: int, stage_name: str) -> None:
+    """在 transforms 顶层写入平均内参统计（与 frames 同级）。"""
+    data.pop("avg_intrinsics", None)
+    if count <= 0:
+        print(f"警告: {stage_name} 没有可用帧用于计算平均内参，跳过写入 avg_intrinsics")
+        return
+
+    data["avg_intrinsics"] = {
+        "fl_x": float(sums["fl_x"] / count),
+        "fl_y": float(sums["fl_y"] / count),
+        "cx": float(sums["cx"] / count),
+        "cy": float(sums["cy"] / count),
+        "w": float(sums["w"] / count),
+        "h": float(sums["h"] / count),
+        "num_frames_used": int(count),
+    }
+
+
 def _save_image(img: Image.Image, out_path: Path) -> None:
     _ensure_dir(out_path.parent)
 
@@ -168,6 +186,10 @@ def _process_transforms_json(
     # 准备两个输出的 transforms.json
     data_stage1 = json.loads(json.dumps(data))  # 深拷贝
     data_stage2 = json.loads(json.dumps(data))
+    stage1_sums = {"fl_x": 0.0, "fl_y": 0.0, "cx": 0.0, "cy": 0.0, "w": 0.0, "h": 0.0}
+    stage2_sums = {"fl_x": 0.0, "fl_y": 0.0, "cx": 0.0, "cy": 0.0, "w": 0.0, "h": 0.0}
+    stage1_count = 0
+    stage2_count = 0
     
     # 处理每个 frame
     for i, frame in enumerate(data['frames']):
@@ -234,6 +256,13 @@ def _process_transforms_json(
             'cx': cx1,
             'cy': cy1,
         })
+        stage1_sums["fl_x"] += float(fx1)
+        stage1_sums["fl_y"] += float(fy1)
+        stage1_sums["cx"] += float(cx1)
+        stage1_sums["cy"] += float(cy1)
+        stage1_sums["w"] += float(w1_final)
+        stage1_sums["h"] += float(h1_final)
+        stage1_count += 1
         
         # 更新 Stage-2 frame
         data_stage2['frames'][i].update({
@@ -244,12 +273,23 @@ def _process_transforms_json(
             'cx': cx2,
             'cy': cy2,
         })
+        stage2_sums["fl_x"] += float(fx2)
+        stage2_sums["fl_y"] += float(fy2)
+        stage2_sums["cx"] += float(cx2)
+        stage2_sums["cy"] += float(cy2)
+        stage2_sums["w"] += float(w2_final)
+        stage2_sums["h"] += float(h2_final)
+        stage2_count += 1
     
     # 如果有全局内参，删除它（因为每个 frame 都有自己的内参了）
     if has_global_intrinsics:
         for key in ['fl_x', 'fl_y', 'cx', 'cy', 'w', 'h']:
             data_stage1.pop(key, None)
             data_stage2.pop(key, None)
+
+    # 写入与 frames 同级的平均内参统计
+    _set_avg_intrinsics(data_stage1, stage1_sums, stage1_count, stage_name="Stage-1")
+    _set_avg_intrinsics(data_stage2, stage2_sums, stage2_count, stage_name="Stage-2")
     
     # 保存
     out_path1 = stage1_out_root / 'transforms.json'

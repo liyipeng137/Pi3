@@ -141,6 +141,18 @@ def save_depth_pngs(depth_np, image_names, output_dir):
         cv2.imwrite(os.path.join(depth_vis_dir, base_name), depth_color)
 
 
+def build_shared_intrinsics(num_frames, fx, fy, cx, cy):
+    K = np.array(
+        [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    return np.repeat(K[None], num_frames, axis=0)
+
+
 if __name__ == '__main__':
     # --- Argument Parsing ---
     parser = argparse.ArgumentParser(description="Run inference with the Pi3 model.")
@@ -151,6 +163,14 @@ if __name__ == '__main__':
     # parser.add_argument("--conditions_path", type=str, default='examples/room/condition.npz',
     parser.add_argument("--conditions_path", type=str, default=None,
                         help="Optional path to a .npz file containing 'poses', 'depths', 'intrinsics'.")
+    parser.add_argument("--fx", type=float, default=None,
+                        help="Manual shared focal length fx in pixels. If set with fy/cx/cy, overrides intrinsics from conditions.")
+    parser.add_argument("--fy", type=float, default=None,
+                        help="Manual shared focal length fy in pixels. If set with fx/cx/cy, overrides intrinsics from conditions.")
+    parser.add_argument("--cx", type=float, default=None,
+                        help="Manual shared principal point cx in pixels. If set with fx/fy/cy, overrides intrinsics from conditions.")
+    parser.add_argument("--cy", type=float, default=None,
+                        help="Manual shared principal point cy in pixels. If set with fx/fy/cx, overrides intrinsics from conditions.")
 
     parser.add_argument("--save_path", type=str, default='examples/result.ply',
                         help="Path to save the output .ply file.")
@@ -168,6 +188,11 @@ if __name__ == '__main__':
                         help="Device to run inference on ('cuda' or 'cpu'). Default: 'cuda'")
                         
     args = parser.parse_args()
+    manual_intrinsics_values = [args.fx, args.fy, args.cx, args.cy]
+    has_manual_intrinsics = any(v is not None for v in manual_intrinsics_values)
+    if has_manual_intrinsics and not all(v is not None for v in manual_intrinsics_values):
+        raise ValueError("If using manual intrinsics, please provide all of --fx --fy --cx --cy.")
+
     if args.interval < 0:
         args.interval = 10 if args.data_path.endswith('.mp4') else 1
     print(f'Sampling interval: {args.interval}')
@@ -211,6 +236,21 @@ if __name__ == '__main__':
 
     # Load images (Required)
     imgs, conditions = load_multimodal_data(args.data_path, conditions, interval=args.interval, device=device) 
+    N = imgs.shape[1]
+
+    # Apply user-provided shared intrinsics (highest priority)
+    if has_manual_intrinsics:
+        intrinsics_np = build_shared_intrinsics(N, args.fx, args.fy, args.cx, args.cy)
+        conditions['intrinsics'] = torch.from_numpy(intrinsics_np).float()[None].to(device)
+        print(
+            "Using manual shared intrinsics for all frames: "
+            f"fx={args.fx:.3f}, fy={args.fy:.3f}, cx={args.cx:.3f}, cy={args.cy:.3f}"
+        )
+
+    # Keep a single source of truth for intrinsics used by downstream exports.
+    intrinsics_used_np = None
+    if conditions.get('intrinsics') is not None:
+        intrinsics_used_np = conditions['intrinsics'][0].detach().cpu().numpy()
 
     """
     Args:
@@ -268,7 +308,12 @@ if __name__ == '__main__':
         from pi3.utils.transforms_utils import recover_intrinsics_from_output
 
         camera_poses = res['camera_poses'][0].detach().cpu().numpy()  # (N, 4, 4), OpenCV cam2world
-        intrinsics_np = recover_intrinsics_from_output(res, imgs)      # (N, 3, 3)
+        if intrinsics_used_np is None:
+            intrinsics_np = recover_intrinsics_from_output(res, imgs)  # (N, 3, 3)
+            print("No input intrinsics found. Recovered intrinsics from local_points for depth export.")
+        else:
+            intrinsics_np = intrinsics_used_np
+            print("Using provided intrinsics for depth export.")
         world_points = res['points'][0][masks].detach().cpu().numpy()  # same points exported to ply
         H, W = imgs.shape[-2:]
 
@@ -298,11 +343,10 @@ if __name__ == '__main__':
         H, W = imgs.shape[-2:]
         
         # 获取内参
-        intrinsics_np = None
-        if conditions.get('intrinsics') is not None:
-            intrinsics_np = conditions['intrinsics'][0].cpu().numpy()  # (N, 3, 3)
-            print(f"使用输入的内参")
-        
+        intrinsics_np = intrinsics_used_np
+        if intrinsics_np is not None:
+            print("使用输入/手动设置的内参")
+
         # 生成图像路径
         image_paths = generate_image_paths(args.data_path, N, save_dir='images')
         
